@@ -5,7 +5,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 
 // 後端伺服器網址（你的 Mac IP）
-const String backendBaseUrl = 'http://219.70.123.30:8001';
+const String backendBaseUrl = 'https://ai-diet-backend-q493.onrender.com';
+
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
