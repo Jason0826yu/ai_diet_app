@@ -1,240 +1,287 @@
 import os
-from fastapi import FastAPI, Request
+import logging
+from typing import List, Optional
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from openai import OpenAI
 
-# 從環境變數拿你的 OPENAI_API_KEY
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# ========= 基本設定 =========
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Demo 用先全開
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ========= 健康檢查 =========
+logger = logging.getLogger("ai_diet_app")
+logging.basicConfig(level=logging.INFO)
+
+# OpenAI Client（用環境變數讀 API Key）
+client = OpenAI()
+
+
+# ========= Pydantic Models =========
+
+class FoodLog(BaseModel):
+    date: str
+    time: str
+    meal_type: str
+    description: str
+
+
+class Context(BaseModel):
+    goal_type: str  # "muscle_gain" / "fat_loss" / "maintenance"
+    today_date: Optional[str] = None
+    current_time: Optional[str] = None
+    timezone: Optional[str] = None
+
+
+class UserProfile(BaseModel):
+    age: Optional[int] = None
+    gender: Optional[str] = None  # "male" / "female" / "other"
+    height_cm: Optional[float] = None
+    weight_kg: Optional[float] = None
+    body_fat_percent: Optional[float] = None
+    target_weight_kg: Optional[float] = None
+    activity_level: Optional[str] = None  # "sedentary" / "normal" / "high"
+    dietary_notes: Optional[str] = None  # 乳糖不耐、素食等備註
+    country: Optional[str] = None        # "taiwan" / "japan" / "usa" / ...
+    lifestyle: Optional[str] = None      # "student" / "office_worker" / ...
+
+
+class AnalyzeDayRequest(BaseModel):
+    context: Context
+    request_type: str
+    food_logs: List[FoodLog]
+    user_profile: Optional[UserProfile] = None  # 之後前端會塞進來，可為 None
+
+
+class AnalyzeDayResponse(BaseModel):
+    success: bool
+    score: int
+    analysis_text: str
+    is_backup: bool = False  # True = 用備用簡單邏輯，不是 OpenAI 回的
+
+
+# ========= Health Check =========
+
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
 
 
-# ========= 主要分析 API（不丟 400/422，永遠回 200） =========
-@app.post("/analyze-day")
-async def analyze_day(request: Request):
+# ========= 工具：根據紀錄粗略算一個分數 =========
+
+def estimate_score(context: Context, food_logs: List[FoodLog]) -> int:
     """
-    這裡不用 Pydantic，直接吃任何 JSON，
-    解析失敗或資料怪怪的，也只會回「備用建議」，不會丟 400/422。
+    很簡單的 rule-based 分數，給 AI 當參考用。
+    不用太準，重點是讓建議有「分數感」。
     """
+    base = 50
 
-    # 預設值：如果等等解析失敗，可以用這些當保底
-    score = 60
-    meal_count = 0
-    logs_text = "（今天沒有成功取得詳細的飲食紀錄）"
-    goal_text = "維持體態"
-    goal_type = "unknown"
-    timezone = "Asia/Taipei"
-    today_date = "（未提供）"
-    request_type = ""
-    profile_text = "（未填個人資料）"
+    count = len(food_logs)
+    if count == 0:
+        return 50
 
-    try:
-        data = await request.json()
-    except Exception:
-        # 連 JSON 都解析失敗：回一個通用備用建議
-        backup = f"""
-目前後端沒有成功收到你的詳細資料，不過先給你一個簡單的方向：
-
-今天粗略評分約 {score} 分。
-
-你可以先這樣做：
-1. 每天至少 1–2 餐有蛋白質：去 7-11 / 全家 買茶葉蛋、無糖豆漿、雞胸肉沙拉。
-2. 至少一餐看得到青菜：去便當店 / 自助餐說「飯少一點，多一份青菜」。
-3. 含糖飲料盡量壓在 0–1 杯，其餘改成無糖茶或白開水。
-"""
-        return {
-            "score": score,
-            "summary": backup,
-            "suggestions": [],
-        }
-
-    # 走到這裡代表至少 JSON 解析成功了
-    context = data.get("context") or {}
-    request_type = data.get("request_type") or ""
-    food_logs = data.get("food_logs") or []
-    user_profile = data.get("user_profile") or {}
-
-    # 目標
-    goal_type = (context.get("goal_type") or "").strip()
-    if goal_type == "muscle_gain":
-        goal_text = "增肌"
-    elif goal_type == "fat_loss":
-        goal_text = "瘦身"
-    elif goal_type == "maintenance":
-        goal_text = "維持體態"
+    # 餐數適中加分
+    if 2 <= count <= 4:
+        base += 15
+    elif count == 1 or count == 5:
+        base += 5
     else:
-        goal_text = "維持體態"
+        base -= 5
 
-    today_date = context.get("today_date") or (
-        food_logs[0].get("date") if isinstance(food_logs, list) and food_logs else "（未提供）"
-    )
-    timezone = context.get("timezone") or "Asia/Taipei"
+    # 目標微調
+    if context.goal_type == "muscle_gain":
+        base += 5
+    elif context.goal_type == "fat_loss":
+        base += 0
+    else:  # maintenance
+        base += 3
 
-    # 整理今天吃的東西
-    if isinstance(food_logs, list) and len(food_logs) > 0:
-        meal_count = len(food_logs)
-        lines = []
-        for log in food_logs:
-            if not isinstance(log, dict):
-                continue
-            time_str = log.get("time", "")
-            meal_type = log.get("meal_type", "")
-            desc = log.get("description", "")
-            lines.append(f"- {time_str}{desc}")
-        if lines:
-            logs_text = "\n".join(lines)
-        else:
-            logs_text = "（有收到 food_logs，但內容格式怪怪的，無法完整解析）"
-    else:
-        meal_count = 0
-        logs_text = "（今天沒有提供任何具體的餐點紀錄）"
+    # 限制在 40～95 之間
+    base = max(40, min(95, base))
+    return int(base)
 
-    # 粗略打分（只是給一個感覺）
-    base_score = 50 + min(4, meal_count) * 10
-    if goal_type == "fat_loss" and meal_count >= 5:
-        base_score -= 10
-    score = max(30, min(95, base_score))
 
-    # 個人資料（會影響 AI 語氣與建議）
+# ========= 主功能：分析今天飲食 =========
+
+@app.post("/analyze-day", response_model=AnalyzeDayResponse)
+async def analyze_day(payload: AnalyzeDayRequest):
+    ctx = payload.context
+    logs = payload.food_logs
+    profile = payload.user_profile
+
+    # 0. 如果今天沒紀錄，就回一個友善訊息
+    if not logs:
+        text = (
+            "【AI 分析結果】\n\n"
+            "今天還沒有任何飲食紀錄喔。\n\n"
+            "建議先記錄至少 1～2 餐，包含餐別（早餐／午餐／晚餐／點心）\n"
+            "以及簡單描述你吃了什麼，這樣我才能給你比較有意義的建議。"
+        )
+        return AnalyzeDayResponse(
+            success=True,
+            score=50,
+            analysis_text=text,
+            is_backup=True,
+        )
+
+    # 1. 先用簡單規則估一個分數，作為 AI 參考
+    score = estimate_score(ctx, logs)
+
+    # 2. 把 food_logs 和 user_profile 整理成文字，給模型看
+    goal_map = {
+        "muscle_gain": "增肌",
+        "fat_loss": "瘦身",
+        "maintenance": "維持體態",
+    }
+    goal_text = goal_map.get(ctx.goal_type, "維持體態")
+
+    # 食物紀錄摘要
+    log_lines = []
+    for i, log in enumerate(logs, 1):
+        log_lines.append(
+            f"{i}. {log.date} {log.time} ─ {log.meal_type}：{log.description}"
+        )
+    logs_text = "\n".join(log_lines)
+
+    # 使用者個人資料摘要（可能為 None，要小心處理）
     profile_lines = []
-    if isinstance(user_profile, dict):
-        age = user_profile.get("age")
-        gender = user_profile.get("gender")
-        height_cm = user_profile.get("height_cm")
-        weight_kg = user_profile.get("weight_kg")
-        body_fat = user_profile.get("body_fat")
-        target_weight_kg = user_profile.get("target_weight_kg")
-        activity_level = user_profile.get("activity_level")
-        special_diet = user_profile.get("special_diet")
-        location = user_profile.get("location")
+    if profile:
+        if profile.age:
+            profile_lines.append(f"年齡：約 {profile.age} 歲")
+        if profile.gender:
+            profile_lines.append(f"性別：{profile.gender}")
+        if profile.height_cm:
+            profile_lines.append(f"身高：約 {profile.height_cm} 公分")
+        if profile.weight_kg:
+            profile_lines.append(f"體重：約 {profile.weight_kg} 公斤")
+        if profile.activity_level:
+            profile_lines.append(f"活動量：{profile.activity_level}")
+        if profile.dietary_notes:
+            profile_lines.append(f"飲食限制／備註：{profile.dietary_notes}")
+        if profile.country:
+            profile_lines.append(f"所在國家：{profile.country}")
+        if profile.lifestyle:
+            profile_lines.append(f"生活型態：{profile.lifestyle}")
+    profile_text = "\n".join(profile_lines) if profile_lines else "未提供詳細個人資料。"
 
-        if age is not None:
-            profile_lines.append(f"年齡：{age}")
-        if gender:
-            profile_lines.append(f"性別：{gender}")
-        if height_cm is not None:
-            profile_lines.append(f"身高：{height_cm} 公分")
-        if weight_kg is not None:
-            profile_lines.append(f"體重：{weight_kg} 公斤")
-        if body_fat is not None:
-            profile_lines.append(f"體脂率：約 {body_fat}%")
-        if target_weight_kg is not None:
-            profile_lines.append(f"目標體重：{target_weight_kg} 公斤")
-        if activity_level:
-            profile_lines.append(f"活動量：{activity_level}")
-        if special_diet:
-            profile_lines.append(f"特殊飲食需求：{special_diet}")
-        if location:
-            profile_lines.append(f"地點：{location}")
+    # 根據國家，給模型不同指示
+    country_hint = ""
+    country = (profile.country or "").lower() if profile else ""
+    if "taiwan" in country or "tw" == country:
+        country_hint = (
+            "使用台灣生活情境的例子，例如：便利商店（7-11、全家）、便當店、自助餐、手搖飲店等。"
+        )
+    elif "japan" in country or "jp" == country:
+        country_hint = (
+            "使用日本常見情境，例如：便利商店便當、定食屋、壽司店等。"
+        )
+    elif "korea" in country or "kr" == country:
+        country_hint = (
+            "使用韓國常見情境，例如：紫菜包飯、湯飯、炸雞配啤酒、便利商店等。"
+        )
+    elif "usa" in country or "us" == country or "united states" in country:
+        country_hint = (
+            "使用美國常見情境，例如：三明治店、沙拉吧、超市熟食、快餐店中較健康的選項。"
+        )
+    else:
+        country_hint = (
+            "使用一般城市生活情境的例子，例如：超市、便利商店、外食餐廳等。"
+        )
 
-    if profile_lines:
-        profile_text = "\n".join(profile_lines)
+    # 3. 呼叫 OpenAI：請他幫忙寫一段完整、像真人教練的建議
+    system_prompt = f"""
+你是一位貼身 AI 營養師，要用「自然的台灣中文」給出具體、可執行的飲食建議，
+口吻友善、像在跟高中生說話，但不要太幼稚，也不要太命令式。
 
-    # ===== 給模型的角色指令（更重視個人資料） =====
-    instructions = """
-你是一位在台灣的營養教練，對台灣高中生日常飲食非常熟（便當店、自助餐、學校附近小吃、全家、7-11、萊爾富、OK 便利商店……）。
+使用者目前的目標是：「{goal_text}」。
 
-請用【繁體中文、台灣用語】，口氣友善、實際可行，不要太嚴厲，像學長姐或家教老師在聊天。
+請依照以下原則回應：
+1. 先用一行說明今天整體大概幾分（0–100 分），但數字請使用後端給你的分數：{score} 分。
+2. 分成四個小段落，每一段前面加上明確標題：
+   A. 今天整體表現總結
+   B. 今天吃得不錯的地方
+   C. 今天可以改進的地方
+   D. 明天可以怎麼做更好（具體到「可以去哪裡買什麼類型的食物」）
 
-請特別根據「使用者個人資料」調整建議，包括：
-- 年齡、性別
-- 身高、體重、（如果有）體脂率
-- 目標體重：如果現在比目標重很多，減脂建議要更明確；如果已經接近目標，不要太嚴格。
-- 活動量：久坐 / 普通 / 高度活動，會影響吃的份量與碳水需求。
-- 特殊飲食需求：例如乳糖不耐、素食，要避免不適合的食物，主動給替代方案。
-- 地點（如果有）：例如在台北，可以更肯定說「附近便利商店一定有」。
-
-另外，請注意：
-1. 使用者的大部分飲食來源會是：
-   - 便利商店（全家、7-11、萊爾富、OK）
-   - 便當店、自助餐
-   - 學校附近小吃、學校福利社
-   - 手搖飲店
-   預算有限，不要建議太貴或太難找到的食物。
-
-2. 建議一定要「具體」＋「在台灣買得到」，像是：
-   - 便利商店：寫清楚可以買「茶葉蛋、地瓜、無糖茶、沙拉、飯糰、無糖豆漿、雞胸肉」。
-   - 便當店 / 自助餐：可以說「跟老闆說飯少一點，多一份青菜，主菜選雞胸、魚、滷雞腿」。
-   - 小吃店：例如「滷味多點青菜、豆干、蛋，少一點內臟和炸物」。
-
-3. 如果使用者有標示特殊飲食（例如：乳糖不耐、素食），務必：
-   - 避免不適合的食材
-   - 主動幫他找在台灣超商或便當店「買得到的替代方案」。
-
-4. 【很重要】系統已經幫你算出一個「今天整體分數（0–100）」，你不要自己再重新打分，只要沿用這個分數來形容即可。
-   - 可以用「大概 xx 分左右」、「接近 xx 分」這種說法，但數字要跟系統給的一致。
-
-5. 回答內容的結構建議：
-   A. 今天整體大概幾分（0–100 分），引用系統給你的分數，簡單講 2–3 句理由，理由可以結合：個人資料＋今天的紀錄。
-   B. 今天吃得不錯的地方（條列 2–4 點），可以提到：
-      - 有符合他目標（增肌 / 瘦身 / 維持體態）
-      - 有照顧到蛋白質、青菜、全穀類、喝水等
-   C. 今天可以改進的地方（條列 2–4 點），要根據他的目標和個人資料微調：
-      - 目標增肌：多提醒蛋白質和總熱量夠不夠
-      - 目標瘦身：提醒總量控制與含糖飲料頻率
-      - 維持體態：提醒維持目前好習慣、避免暴飲暴食
-   D. 明天可以怎麼做更好（給 3–5 個非常具體的行動建議），每一點都要寫：
-      - 吃什麼（舉例）
-      - 大概要吃多少（大概份量就好，例如「一碗飯」、「一小杯」、「一份主菜」）
-      - 可以去哪裡買（便利商店 / 便當店 / 自助餐 / 學校福利社……）。
+3. 每一點都盡量具體，不要只說「多吃健康食物」，要像：
+   - 「可以去全家買地瓜＋茶葉蛋」
+   - 「自助餐選 1 份肉、2 份青菜，飯七分滿」
+4. {country_hint}
+5. 回覆請全部使用繁體中文，不要出現程式碼或 JSON，只要可讀文字即可。
+6. 可以適度使用條列式（-、1. 2. 3.），讓內容好讀，但不要太長篇大論。
 """
 
-    # ===== 給模型看的 input =====
     user_prompt = f"""
-[系統評估分數（0–100）]
-{score}
+【今日基本資訊】
+目標：{goal_text}
+日期：{ctx.today_date or "-"}
+時區：{ctx.timezone or "-"}
 
-[使用者目標]
-{goal_text}（原始代碼：{goal_type or "未提供"}）
-
-[使用者所在地]
-台灣（時區：{timezone}）
-
-[今天日期]
-{today_date}
-
-[request_type]
-{request_type}
-
-[使用者個人資料]
+【使用者個人資料】
 {profile_text}
 
-[今天的飲食紀錄]
+【今日飲食紀錄】
 {logs_text}
 
-請依照上面的說明，幫這位在台灣的學生做「真正個人化」的飲食分析與具體建議。
+請根據以上資訊，產生一段「貼身 AI 營養教練」風格的回覆。
+記得使用給你的分數 {score} 分作為整體評分的基準。
 """
 
     try:
-        resp = client.responses.create(
-            model="gpt-4o-mini",
-            instructions=instructions.strip(),
-            input=user_prompt.strip(),
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.7,
         )
-        ai_text = resp.output_text
+
+        ai_text = completion.choices[0].message.content or ""
+        full_text = f"【AI 分析結果】\n\n{ai_text}"
+
+        return AnalyzeDayResponse(
+            success=True,
+            score=score,
+            analysis_text=full_text,
+            is_backup=False,
+        )
+
     except Exception as e:
-        print("OpenAI 錯誤：", e)
-        ai_text = f"""
-目前暫時無法連線到真正的 AI 模型，以下是備用的簡單建議：
+        # 發生錯誤時：記 log，改用備用簡單訊息
+        logger.error(f"OpenAI 錯誤：{e}")
 
-今天粗略評分約 {score} 分。
+        basic_country_note = (
+            "你可以優先利用附近的便利商店、便當店、自助餐，"
+            "盡量選擇有蛋白質（雞肉、魚、蛋、豆腐）和青菜的組合，"
+            "飲料以無糖或微糖為主。"
+        )
 
-你可以先這樣做：
-1. 每天至少 1–2 餐有蛋白質：在 7-11 / 全家 買茶葉蛋、無糖豆漿、雞胸肉沙拉。
-2. 至少一餐看得到青菜：去便當店 / 自助餐說「飯少一點，多一份青菜」。
-3. 含糖飲料盡量壓在 0–1 杯，其餘改成無糖茶或白開水。
+        backup_text = (
+            "【AI 分析結果】\n\n"
+            f"今天共有 {len(logs)} 筆飲食紀錄，粗略評估大約是 {score} 分。\n\n"
+            "目前暫時無法連線到雲端 AI 模型，所以這是備用的簡單規則建議：\n\n"
+            "・盡量讓每一餐都包含：蛋白質來源、一些澱粉、至少一份蔬菜。\n"
+            "・含糖手搖飲的頻率控制在一週 1–2 次，其他時間以水或無糖茶為主。\n"
+            "・若你想要增肌，可以特別注意每天至少有 2–3 餐有明顯的蛋白質來源。\n"
+            "・若你想要瘦身，可以先從減少含糖飲料和油炸開始，"
+            "改成烤、滷、清蒸等做法。\n\n"
+            f"{basic_country_note}\n\n"
+            "之後如果雲端 AI 恢復正常，再按一次分析，就會得到更客製化的文字建議。"
+        )
 
-之後 AI 恢復正常時，就會用你這些紀錄做更細的分析。
-"""
-
-    # 不管怎樣都回 200，讓前端好處理
-    return {
-        "score": score,
-        "summary": ai_text,
-        "suggestions": [],
-    }
+        return AnalyzeDayResponse(
+            success=True,
+            score=score,
+            analysis_text=backup_text,
+            is_backup=True,
+        )
