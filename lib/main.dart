@@ -1,171 +1,326 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:http/http.dart' as http;
 
-// 後端伺服器網址（你的 Mac IP）
+/// 你現在用雲端後端（Render）就填這個
+/// 例：'https://ai-diet-backend-q493.onrender.com'
 const String backendBaseUrl = 'https://ai-diet-backend-q493.onrender.com';
-
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const MyApp());
 }
 
+/* ===========================
+   App / Theme
+=========================== */
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(
+    final theme = ThemeData(
+      useMaterial3: true,
+      colorSchemeSeed: const Color(0xFF2E7D32),
+      scaffoldBackgroundColor: const Color(0xFFF7F7FA),
+    );
+
+    return MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: HomePage(),
+      theme: theme,
+      home: const HomePage(),
     );
   }
 }
 
-// ================== 使用者個人資料 Model ==================
+/* ===========================
+   Models
+=========================== */
+class FoodRecord {
+  final String meal; // 早餐/午餐/晚餐/點心
+  final String food; // 文字描述
+  final DateTime time;
+
+  FoodRecord({
+    required this.meal,
+    required this.food,
+    required this.time,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'meal': meal,
+        'food': food,
+        'time': time.toIso8601String(),
+      };
+
+  static FoodRecord fromJson(Map<String, dynamic> m) => FoodRecord(
+        meal: (m['meal'] ?? '') as String,
+        food: (m['food'] ?? '') as String,
+        time: DateTime.tryParse((m['time'] ?? '') as String) ?? DateTime.now(),
+      );
+}
+
 class UserProfile {
-  final int? age;
-  final String? gender; // 'male' / 'female' / 'other'
-  final double? heightCm;
-  final double? weightKg;
-  final double? bodyFat;
-  final double? targetWeightKg;
-  final String? activityLevel; // 'low' / 'medium' / 'high'
-  final String? dietaryNeeds; // 乳糖不耐、素食等
+  int? age;
+  String? gender; // 男/女/其他
+  int? heightCm;
+  double? weightKg;
+  String? activityLevel; // 久坐/普通/高度活動
+  String country; // 台灣/日本/韓國/美國/其他
+  String? dietaryNotes;
 
   UserProfile({
     this.age,
     this.gender,
     this.heightCm,
     this.weightKg,
-    this.bodyFat,
-    this.targetWeightKg,
     this.activityLevel,
-    this.dietaryNeeds,
+    this.country = '台灣',
+    this.dietaryNotes,
   });
 
-  Map<String, dynamic> toJson() {
-    return {
-      'age': age,
-      'gender': gender,
-      'height_cm': heightCm,
-      'weight_kg': weightKg,
-      'body_fat': bodyFat,
-      'target_weight_kg': targetWeightKg,
-      'activity_level': activityLevel,
-      'dietary_needs': dietaryNeeds,
-    };
-  }
+  Map<String, dynamic> toJson() => {
+        'age': age,
+        'gender': gender,
+        'height_cm': heightCm,
+        'weight_kg': weightKg,
+        'activity_level': activityLevel,
+        'country': country,
+        'dietary_notes': dietaryNotes,
+      };
 
-  factory UserProfile.fromJson(Map<String, dynamic> json) {
-    double? _toDouble(dynamic v) {
-      if (v == null) return null;
-      if (v is num) return v.toDouble();
-      if (v is String) {
-        return double.tryParse(v);
-      }
-      return null;
-    }
+  static UserProfile fromJson(Map<String, dynamic> m) => UserProfile(
+        age: (m['age'] is int) ? m['age'] as int : int.tryParse('${m['age']}'),
+        gender: (m['gender'] as String?)?.trim(),
+        heightCm: (m['height_cm'] is int)
+            ? m['height_cm'] as int
+            : int.tryParse('${m['height_cm']}'),
+        weightKg: (m['weight_kg'] is num)
+            ? (m['weight_kg'] as num).toDouble()
+            : double.tryParse('${m['weight_kg']}'),
+        activityLevel: (m['activity_level'] as String?)?.trim(),
+        country: ((m['country'] as String?)?.trim().isNotEmpty ?? false)
+            ? (m['country'] as String).trim()
+            : '台灣',
+        dietaryNotes: (m['dietary_notes'] as String?)?.trim(),
+      );
+}
 
-    int? _toInt(dynamic v) {
-      if (v == null) return null;
-      if (v is int) return v;
-      if (v is num) return v.toInt();
-      if (v is String) {
-        return int.tryParse(v);
-      }
-      return null;
-    }
+/* ===========================
+   SharedPreferences Keys
+=========================== */
+const String _prefsFoodKey = 'food_records'; // List<FoodRecord>
+const String _prefsProfileKey = 'user_profile'; // UserProfile
+const String _prefsGoalKey = 'goal_selected'; // String
 
-    return UserProfile(
-      age: _toInt(json['age']),
-      gender: json['gender'] as String?,
-      heightCm: _toDouble(json['height_cm']),
-      weightKg: _toDouble(json['weight_kg']),
-      bodyFat: _toDouble(json['body_fat']),
-      targetWeightKg: _toDouble(json['target_weight_kg']),
-      activityLevel: json['activity_level'] as String?,
-      dietaryNeeds: json['dietary_needs'] as String?,
+/* ===========================
+   Helpers
+=========================== */
+DateTime _dateOnly(DateTime dt) => DateTime(dt.year, dt.month, dt.day);
+
+String _fmtDate(DateTime dt) =>
+    '${dt.year.toString().padLeft(4, '0')}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}';
+
+String _fmtTime(DateTime dt) =>
+    '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+
+String _goalToType(String goal) {
+  if (goal == '增肌') return 'muscle_gain';
+  if (goal == '瘦身') return 'fat_loss';
+  return 'maintenance';
+}
+
+/* ===========================
+   UI Widgets (Small)
+=========================== */
+class _SectionCard extends StatelessWidget {
+  final Widget child;
+  const _SectionCard({required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      elevation: 0,
+      color: Colors.white,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: child,
+      ),
     );
   }
 }
 
-// ================== 首頁：個人資料 + 目標 + 歷史紀錄入口 ==================
-class HomePage extends StatelessWidget {
+class _PrimaryButton extends StatelessWidget {
+  final String text;
+  final VoidCallback? onPressed;
+  const _PrimaryButton({required this.text, this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    return FilledButton(
+      onPressed: onPressed,
+      style: FilledButton.styleFrom(
+        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      ),
+      child: Text(text, style: const TextStyle(fontWeight: FontWeight.w700)),
+    );
+  }
+}
+
+/* ===========================
+   HomePage (Goal + Quick Entry)
+=========================== */
+class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
-  void goToGoalPage(BuildContext context, String goal) {
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  String _goal = '維持體態';
+  UserProfile? _profile;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadGoalAndProfile();
+  }
+
+  Future<void> _loadGoalAndProfile() async {
+    final prefs = await SharedPreferences.getInstance();
+    final g = prefs.getString(_prefsGoalKey);
+    final rawProfile = prefs.getString(_prefsProfileKey);
+
+    setState(() {
+      _goal = g ?? '維持體態';
+      _profile = rawProfile == null
+          ? null
+          : UserProfile.fromJson(jsonDecode(rawProfile) as Map<String, dynamic>);
+    });
+  }
+
+  Future<void> _saveGoal(String goal) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefsGoalKey, goal);
+    setState(() => _goal = goal);
+  }
+
+  void _goToFoodLog() {
     Navigator.push(
       context,
-      MaterialPageRoute(
-        builder: (context) => GoalPage(goal: goal),
-      ),
+      MaterialPageRoute(builder: (_) => FoodLogPage(goal: _goal)),
     );
   }
 
-  void goToProfilePage(BuildContext context) {
-    Navigator.push(
+  void _goToProfile() async {
+    await Navigator.push(
       context,
-      MaterialPageRoute(
-        builder: (context) => const UserProfilePage(),
-      ),
+      MaterialPageRoute(builder: (_) => const ProfilePage()),
     );
-  }
-
-  void goToHistoryPage(BuildContext context) {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => const HistoryPage(),
-      ),
-    );
+    // 回來後刷新
+    _loadGoalAndProfile();
   }
 
   @override
   Widget build(BuildContext context) {
+    final profileHint = (_profile == null)
+        ? '尚未設定（建議先填，AI 會更準）'
+        : '${_profile!.country}｜${_profile!.activityLevel ?? '活動量未填'}';
+
     return Scaffold(
-      appBar: AppBar(title: const Text('AI 飲食教練')),
+      appBar: AppBar(
+        title: const Text('專屬貼身 AI 營養師'),
+        actions: [
+          IconButton(
+            onPressed: _goToProfile,
+            icon: const Icon(Icons.person_outline),
+            tooltip: '個人資料',
+          ),
+        ],
+      ),
       body: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+        padding: const EdgeInsets.all(16),
+        child: ListView(
           children: [
-            const SizedBox(height: 16),
-            ElevatedButton(
-              onPressed: () => goToProfilePage(context),
-              child: const Text('設定 / 編輯個人資料'),
+            _SectionCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '今天目標',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      ChoiceChip(
+                        label: const Text('增肌'),
+                        selected: _goal == '增肌',
+                        onSelected: (_) => _saveGoal('增肌'),
+                      ),
+                      ChoiceChip(
+                        label: const Text('瘦身'),
+                        selected: _goal == '瘦身',
+                        onSelected: (_) => _saveGoal('瘦身'),
+                      ),
+                      ChoiceChip(
+                        label: const Text('維持體態'),
+                        selected: _goal == '維持體態',
+                        onSelected: (_) => _saveGoal('維持體態'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      const Icon(Icons.info_outline, size: 18),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '個人資料：$profileHint',
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: _goToProfile,
+                        child: const Text('去設定'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
             ),
             const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: () => goToHistoryPage(context),
-              child: const Text('查看歷史紀錄'),
+            _SectionCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '開始記錄',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
+                  ),
+                  const SizedBox(height: 10),
+                  const Text(
+                    '你記越多天，AI 就越像「懂你」的教練，不會每次講一樣。',
+                    style: TextStyle(fontSize: 13),
+                  ),
+                  const SizedBox(height: 14),
+                  _PrimaryButton(
+                    text: '進入記錄頁（今天）',
+                    onPressed: _goToFoodLog,
+                  ),
+                ],
+              ),
             ),
-            const SizedBox(height: 24),
-            const Divider(),
-            const SizedBox(height: 24),
-            const Text(
-              '選擇你的目標',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 40),
-            ElevatedButton(
-              onPressed: () => goToGoalPage(context, '增肌'),
-              child: const Text('增肌'),
-            ),
-            const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: () => goToGoalPage(context, '瘦身'),
-              child: const Text('瘦身'),
-            ),
-            const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: () => goToGoalPage(context, '維持體態'),
-              child: const Text('維持體態'),
-            ),
+            
+            
           ],
         ),
       ),
@@ -173,25 +328,25 @@ class HomePage extends StatelessWidget {
   }
 }
 
-// ================== 個人資料設定頁 ==================
-class UserProfilePage extends StatefulWidget {
-  const UserProfilePage({super.key});
+/* ===========================
+   ProfilePage (User data + country)
+=========================== */
+class ProfilePage extends StatefulWidget {
+  const ProfilePage({super.key});
 
   @override
-  State<UserProfilePage> createState() => _UserProfilePageState();
+  State<ProfilePage> createState() => _ProfilePageState();
 }
 
-class _UserProfilePageState extends State<UserProfilePage> {
-  static const _profileKey = 'user_profile';
+class _ProfilePageState extends State<ProfilePage> {
+  final _ageCtrl = TextEditingController();
+  final _heightCtrl = TextEditingController();
+  final _weightCtrl = TextEditingController();
+  final _notesCtrl = TextEditingController();
 
-  final TextEditingController _ageController = TextEditingController();
-  String _gender = 'male';
-  final TextEditingController _heightController = TextEditingController();
-  final TextEditingController _weightController = TextEditingController();
-  final TextEditingController _bodyFatController = TextEditingController();
-  final TextEditingController _targetWeightController = TextEditingController();
-  String _activityLevel = 'medium';
-  final TextEditingController _dietaryNeedsController = TextEditingController();
+  String _gender = '男';
+  String _activity = '普通';
+  String _country = '台灣';
 
   bool _loading = true;
 
@@ -203,69 +358,50 @@ class _UserProfilePageState extends State<UserProfilePage> {
 
   @override
   void dispose() {
-    _ageController.dispose();
-    _heightController.dispose();
-    _weightController.dispose();
-    _bodyFatController.dispose();
-    _targetWeightController.dispose();
-    _dietaryNeedsController.dispose();
+    _ageCtrl.dispose();
+    _heightCtrl.dispose();
+    _weightCtrl.dispose();
+    _notesCtrl.dispose();
     super.dispose();
   }
 
   Future<void> _loadProfile() async {
     final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_profileKey);
-    if (raw != null) {
-      try {
-        final map = jsonDecode(raw) as Map<String, dynamic>;
-        final profile = UserProfile.fromJson(map);
-        _ageController.text = profile.age?.toString() ?? '';
-        _gender = profile.gender ?? 'male';
-        _heightController.text = profile.heightCm?.toString() ?? '';
-        _weightController.text = profile.weightKg?.toString() ?? '';
-        _bodyFatController.text = profile.bodyFat?.toString() ?? '';
-        _targetWeightController.text = profile.targetWeightKg?.toString() ?? '';
-        _activityLevel = profile.activityLevel ?? 'medium';
-        _dietaryNeedsController.text = profile.dietaryNeeds ?? '';
-      } catch (_) {
-        // ignore invalid saved data
-      }
+    final raw = prefs.getString(_prefsProfileKey);
+    if (raw == null) {
+      setState(() => _loading = false);
+      return;
     }
+
+    final p = UserProfile.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    _ageCtrl.text = p.age?.toString() ?? '';
+    _heightCtrl.text = p.heightCm?.toString() ?? '';
+    _weightCtrl.text = p.weightKg?.toString() ?? '';
+    _notesCtrl.text = p.dietaryNotes ?? '';
+
     setState(() {
+      _gender = (p.gender?.isNotEmpty ?? false) ? p.gender! : '男';
+      _activity = (p.activityLevel?.isNotEmpty ?? false) ? p.activityLevel! : '普通';
+      _country = p.country;
       _loading = false;
     });
   }
 
-  Future<void> _saveProfile() async {
-    int? _toInt(String value) {
-      final v = value.trim();
-      if (v.isEmpty) return null;
-      return int.tryParse(v);
-    }
-
-    double? _toDouble(String value) {
-      final v = value.trim();
-      if (v.isEmpty) return null;
-      return double.tryParse(v);
-    }
-
-    final profile = UserProfile(
-      age: _toInt(_ageController.text),
+  Future<void> _save() async {
+    final prefs = await SharedPreferences.getInstance();
+    final p = UserProfile(
+      age: int.tryParse(_ageCtrl.text.trim()),
       gender: _gender,
-      heightCm: _toDouble(_heightController.text),
-      weightKg: _toDouble(_weightController.text),
-      bodyFat: _toDouble(_bodyFatController.text),
-      targetWeightKg: _toDouble(_targetWeightController.text),
-      activityLevel: _activityLevel,
-      dietaryNeeds: _dietaryNeedsController.text.trim().isEmpty
-          ? null
-          : _dietaryNeedsController.text.trim(),
+      heightCm: int.tryParse(_heightCtrl.text.trim()),
+      weightKg: double.tryParse(_weightCtrl.text.trim()),
+      activityLevel: _activity,
+      country: _country,
+      dietaryNotes: _notesCtrl.text.trim().isEmpty ? null : _notesCtrl.text.trim(),
     );
 
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_profileKey, jsonEncode(profile.toJson()));
-
+    await prefs.setString(_prefsProfileKey, jsonEncode(p.toJson()));
     if (!mounted) return;
+
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('已儲存個人資料')),
     );
@@ -275,162 +411,101 @@ class _UserProfilePageState extends State<UserProfilePage> {
   @override
   Widget build(BuildContext context) {
     if (_loading) {
-      return Scaffold(
-        appBar: AppBar(
-          title: const Text('個人資料設定'),
-        ),
-        body: const Center(
-          child: CircularProgressIndicator(),
-        ),
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
       );
     }
 
+    InputDecoration deco(String label, {String? hint}) => InputDecoration(
+          labelText: label,
+          hintText: hint,
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+        );
+
     return Scaffold(
       appBar: AppBar(title: const Text('個人資料設定')),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            TextField(
-              controller: _ageController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: '年齡（歲）',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              value: _gender,
-              decoration: const InputDecoration(
-                labelText: '性別',
-                border: OutlineInputBorder(),
-              ),
-              items: const [
-                DropdownMenuItem(value: 'male', child: Text('男')),
-                DropdownMenuItem(value: 'female', child: Text('女')),
-                DropdownMenuItem(value: 'other', child: Text('其他 / 不方便透露')),
-              ],
-              onChanged: (v) {
-                if (v == null) return;
-                setState(() {
-                  _gender = v;
-                });
-              },
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _heightController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: '身高（公分）',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _weightController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: '體重（公斤）',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _bodyFatController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: '體脂率（%，可不填）',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _targetWeightController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: '目標體重（公斤，可不填）',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              value: _activityLevel,
-              decoration: const InputDecoration(
-                labelText: '活動量',
-                border: OutlineInputBorder(),
-              ),
-              items: const [
-                DropdownMenuItem(value: 'low', child: Text('久坐 / 幾乎不運動')),
-                DropdownMenuItem(value: 'medium', child: Text('普通活動量（學生、走動）')),
-                DropdownMenuItem(value: 'high', child: Text('高活動量（常運動、體育訓練）')),
-              ],
-              onChanged: (v) {
-                if (v == null) return;
-                setState(() {
-                  _activityLevel = v;
-                });
-              },
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _dietaryNeedsController,
-              decoration: const InputDecoration(
-                labelText: '特殊飲食需求（例如：乳糖不耐、蛋奶素、海鮮過敏，可不填）',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 20),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: _saveProfile,
-                child: const Text('儲存'),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ================== 目標頁 ==================
-class GoalPage extends StatelessWidget {
-  final String goal;
-
-  const GoalPage({super.key, required this.goal});
-
-  void goToFoodLogPage(BuildContext context) {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => FoodLogPage(goal: goal),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('你的目標')),
       body: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+        padding: const EdgeInsets.all(16),
+        child: ListView(
           children: [
-            const SizedBox(height: 40),
-            Text(
-              '你選擇的目標是：\n\n$goal',
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+            _SectionCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('基本資料', style: TextStyle(fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _ageCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: deco('年齡', hint: '例如：16'),
+                  ),
+                  const SizedBox(height: 10),
+                  DropdownButtonFormField<String>(
+                    value: _gender,
+                    decoration: deco('性別'),
+                    items: const [
+                      DropdownMenuItem(value: '男', child: Text('男')),
+                      DropdownMenuItem(value: '女', child: Text('女')),
+                      DropdownMenuItem(value: '其他', child: Text('其他')),
+                    ],
+                    onChanged: (v) => setState(() => _gender = v ?? '男'),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _heightCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: deco('身高（cm）', hint: '例如：170'),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _weightCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: deco('體重（kg）', hint: '例如：55'),
+                  ),
+                ],
+              ),
             ),
-            const SizedBox(height: 40),
-            ElevatedButton(
-              onPressed: () => goToFoodLogPage(context),
-              child: const Text('開始記錄今天的飲食'),
+            const SizedBox(height: 12),
+            _SectionCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('情境設定', style: TextStyle(fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
+                    value: _activity,
+                    decoration: deco('活動量'),
+                    items: const [
+                      DropdownMenuItem(value: '久坐', child: Text('久坐')),
+                      DropdownMenuItem(value: '普通', child: Text('普通')),
+                      DropdownMenuItem(value: '高度活動', child: Text('高度活動')),
+                    ],
+                    onChanged: (v) => setState(() => _activity = v ?? '普通'),
+                  ),
+                  const SizedBox(height: 10),
+                  DropdownButtonFormField<String>(
+                    value: _country,
+                    decoration: deco('所在國家（影響推薦）'),
+                    items: const [
+                      DropdownMenuItem(value: '台灣', child: Text('台灣')),
+                      DropdownMenuItem(value: '日本', child: Text('日本')),
+                      DropdownMenuItem(value: '韓國', child: Text('韓國')),
+                      DropdownMenuItem(value: '美國', child: Text('美國')),
+                      DropdownMenuItem(value: '其他', child: Text('其他')),
+                    ],
+                    onChanged: (v) => setState(() => _country = v ?? '台灣'),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _notesCtrl,
+                    maxLines: 3,
+                    decoration: deco('特殊飲食需求/備註', hint: '例如：乳糖不耐、素食、過敏'),
+                  ),
+                ],
+              ),
             ),
+            const SizedBox(height: 14),
+            _PrimaryButton(text: '儲存', onPressed: _save),
           ],
         ),
       ),
@@ -438,10 +513,11 @@ class GoalPage extends StatelessWidget {
   }
 }
 
-// ================== 飲食紀錄頁（每天分開顯示） ==================
+/* ===========================
+   FoodLogPage (Daily + AI plan)
+=========================== */
 class FoodLogPage extends StatefulWidget {
   final String goal;
-
   const FoodLogPage({super.key, required this.goal});
 
   @override
@@ -452,34 +528,16 @@ class _FoodLogPageState extends State<FoodLogPage> {
   final TextEditingController _foodController = TextEditingController();
   String _selectedMeal = '早餐';
 
-  final List<_FoodRecord> _allRecords = [];
-  String _suggestion = '';
+  final List<FoodRecord> _allRecords = [];
+  bool _loading = true;
 
-  static const _prefsKey = 'food_records';
-  static const _profileKey = 'user_profile';
-
-  UserProfile? _userProfile;
-
-  DateTime get _todayDate {
-    final now = DateTime.now();
-    return DateTime(now.year, now.month, now.day);
-  }
-
-  List<_FoodRecord> get _todayRecords {
-    final t = _todayDate;
-    final list = _allRecords.where((r) {
-      final d = r.time;
-      return d.year == t.year && d.month == t.month && d.day == t.day;
-    }).toList();
-    list.sort((a, b) => a.time.compareTo(b.time));
-    return list;
-  }
+  bool _aiLoading = false;
+  String _aiText = '';
 
   @override
   void initState() {
     super.initState();
     _loadRecords();
-    _loadUserProfile();
   }
 
   @override
@@ -488,68 +546,49 @@ class _FoodLogPageState extends State<FoodLogPage> {
     super.dispose();
   }
 
-  Future<void> _loadUserProfile() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_profileKey);
-    if (raw == null) return;
-    try {
-      final map = jsonDecode(raw) as Map<String, dynamic>;
-      setState(() {
-        _userProfile = UserProfile.fromJson(map);
-      });
-    } catch (_) {
-      // ignore
-    }
+  DateTime get _today => _dateOnly(DateTime.now());
+
+  List<FoodRecord> get _todayRecords {
+    final t = _today;
+    final list = _allRecords.where((r) {
+      final d = _dateOnly(r.time);
+      return d.year == t.year && d.month == t.month && d.day == t.day;
+    }).toList();
+    list.sort((a, b) => a.time.compareTo(b.time));
+    return list;
+  }
+
+  List<FoodRecord> get _last7DaysRecords {
+    final now = DateTime.now();
+    final from = _dateOnly(now.subtract(const Duration(days: 6))); // 含今天共7天
+    final list = _allRecords.where((r) => _dateOnly(r.time).isAfter(from.subtract(const Duration(days: 1)))).toList();
+    list.sort((a, b) => a.time.compareTo(b.time));
+    return list;
   }
 
   Future<void> _loadRecords() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_prefsKey);
-      if (raw == null) return;
-
-      final List<dynamic> decoded = jsonDecode(raw);
-      final loaded = decoded.map((e) {
-        if (e is Map<String, dynamic>) {
-          return _FoodRecord(
-            meal: e['meal'] as String,
-            food: e['food'] as String,
-            time: DateTime.parse(e['time'] as String),
-          );
-        } else if (e is Map) {
-          return _FoodRecord(
-            meal: e['meal'] as String,
-            food: e['food'] as String,
-            time: DateTime.parse(e['time'] as String),
-          );
-        } else {
-          return _FoodRecord(
-            meal: '未知',
-            food: '未知',
-            time: DateTime.now(),
-          );
-        }
-      }).toList();
-
-      setState(() {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_prefsFoodKey);
+    if (raw != null) {
+      try {
+        final decoded = jsonDecode(raw) as List<dynamic>;
+        final loaded = decoded
+            .whereType<Map>()
+            .map((e) => FoodRecord.fromJson(Map<String, dynamic>.from(e)))
+            .toList();
         _allRecords.clear();
         _allRecords.addAll(loaded);
-      });
-    } catch (e) {
-      // ignore invalid data
+      } catch (_) {
+        // 忽略壞資料
+      }
     }
+    setState(() => _loading = false);
   }
 
   Future<void> _saveRecords() async {
     final prefs = await SharedPreferences.getInstance();
-    final list = _allRecords
-        .map((r) => {
-              'meal': r.meal,
-              'food': r.food,
-              'time': r.time.toIso8601String(),
-            })
-        .toList();
-    await prefs.setString(_prefsKey, jsonEncode(list));
+    final list = _allRecords.map((e) => e.toJson()).toList();
+    await prefs.setString(_prefsFoodKey, jsonEncode(list));
   }
 
   void _addRecord() {
@@ -563,755 +602,297 @@ class _FoodLogPageState extends State<FoodLogPage> {
 
     setState(() {
       _allRecords.add(
-        _FoodRecord(
-          meal: _selectedMeal,
-          food: text,
-          time: DateTime.now(),
-        ),
+        FoodRecord(meal: _selectedMeal, food: text, time: DateTime.now()),
       );
       _foodController.clear();
     });
-
     _saveRecords();
   }
 
-  void _deleteRecord(int index) {
+  void _deleteTodayRecord(int index) {
     final todayList = _todayRecords;
     if (index < 0 || index >= todayList.length) return;
     final target = todayList[index];
 
     setState(() {
       _allRecords.removeWhere((r) =>
-          r.meal == target.meal &&
-          r.food == target.food &&
-          r.time == target.time);
+          r.meal == target.meal && r.food == target.food && r.time == target.time);
     });
     _saveRecords();
   }
 
-  void _generateSuggestion() {
-    final todayList = _todayRecords;
-    if (todayList.isEmpty) {
-      setState(() {
-        _suggestion =
-            '你今天還沒有任何紀錄，先記錄至少 1 餐，我才能幫你判斷下一餐喔。';
-      });
-      return;
+  Future<UserProfile?> _loadProfile() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_prefsProfileKey);
+    if (raw == null) return null;
+    try {
+      return UserProfile.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (_) {
+      return null;
     }
-
-    final goal = widget.goal;
-    final count = todayList.length;
-
-    String result;
-
-    if (goal == '增肌') {
-      if (count <= 2) {
-        result =
-            '目標是增肌，但你今天吃得還不多。下一餐可以再補一份高蛋白主餐（例如：雞胸肉、牛肉、豆腐、蛋），搭配主食與一些蔬菜。';
-      } else {
-        result =
-            '你今天的餐數已經不算少了。下一餐可以選高蛋白但不要太油膩的組合，例如：烤雞沙拉飯、牛肉飯＋無糖飲料。記得睡前可以再補一點蛋白質。';
-      }
-    } else if (goal == '瘦身') {
-      if (count >= 3) {
-        result =
-            '今天吃的餐數已經夠了，下一餐建議走「清爽＋高纖維」路線，例如：沙拉、湯品、燙青菜，避免油炸與含糖飲料。';
-      } else {
-        result =
-            '你正在瘦身，下一餐可以選擇「高纖＋有蛋白質但澱粉適中」的餐，例如：雞胸沙拉、燙青菜＋少量飯，飲料選無糖或微糖。';
-      }
-    } else {
-      result =
-          '你目前是維持體態為主。下一餐可以選擇「有主食、有蛋白質、有蔬菜」的均衡餐，例如：便當類（少炸物）、和風丼飯＋青菜，飲料盡量減糖。';
-    }
-
-    setState(() {
-      _suggestion = result;
-    });
   }
 
-  void _goToSummary() {
-    final todayList = _todayRecords;
-    if (todayList.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text('先記錄至少 1 餐，再看今天總結會比較有意義喔。')),
-      );
-      return;
-    }
+  /// 組給後端：把「最近 7 天」一起送，AI 才會開始像真的
+  Future<Map<String, dynamic>> _buildAnalyzePayload() async {
+    final profile = await _loadProfile();
+    final logs = _last7DaysRecords.map((r) {
+      return {
+        "date": _fmtDate(r.time),
+        "meal_type": r.meal,
+        "description": r.food,
+      };
+    }).toList();
 
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => SummaryPage(
-          goal: widget.goal,
-          records: List<_FoodRecord>.from(todayList),
-        ),
-      ),
-    );
-  }
-
-  String _goalToBackendKey() {
-    if (widget.goal == '增肌') return 'muscle_gain';
-    if (widget.goal == '瘦身') return 'fat_loss';
-    return 'maintenance';
-  }
-
-  Map<String, dynamic> _buildUserProfileJson() {
-    if (_userProfile == null) return {};
-    return _userProfile!.toJson();
-  }
-
-  // ====== 組出「今天」的 AI JSON（給預覽用） ======
-  String _buildAiRequestJsonForToday() {
-    final now = DateTime.now();
-    final today = _todayDate;
-    final todayList = _todayRecords;
-
-    final data = {
-      "date":
-          "${today.year.toString().padLeft(4, '0')}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}",
-      "goal": _goalToBackendKey(),
-      "records": todayList.map((r) {
-        final timeStr =
-            "${r.time.hour.toString().padLeft(2, '0')}:${r.time.minute.toString().padLeft(2, '0')}";
-        return {
-          "time": timeStr,
-          "mealType": r.meal,
-          "description": r.food,
-        };
-      }).toList(),
-      "user_profile": _buildUserProfileJson(),
-      "meta": {
-        "generated_at": now.toIso8601String(),
-        "timezone": "Asia/Taipei",
-      }
+    return {
+      "context": {
+        "goal_type": _goalToType(widget.goal),
+      },
+      "food_logs": logs,
+      "user_profile": profile?.toJson(),
     };
-
-    const encoder = JsonEncoder.withIndent('  ');
-    return encoder.convert(data);
   }
 
-  void _previewAiJson() {
-    final todayList = _todayRecords;
-    if (todayList.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('至少先記錄 1 餐，才有資料可以給 AI。')),
-      );
-      return;
+  Future<String> _postJson(String url, Map<String, dynamic> body) async {
+    final client = HttpClient();
+    try {
+      final uri = Uri.parse(url);
+      final req = await client.postUrl(uri);
+      req.headers.set(HttpHeaders.contentTypeHeader, 'application/json; charset=utf-8');
+      req.add(utf8.encode(jsonEncode(body)));
+
+      final resp = await req.close();
+      final respBody = await resp.transform(utf8.decoder).join();
+
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        throw HttpException('HTTP ${resp.statusCode}: $respBody');
+      }
+      return respBody;
+    } finally {
+      client.close(force: true);
     }
-
-    final jsonText = _buildAiRequestJsonForToday();
-
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => AiRequestPreviewPage(jsonText: jsonText),
-      ),
-    );
   }
 
-  void _goToWeeklyPlan() {
+  Future<void> _runAiAnalyze() async {
     if (_allRecords.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('先記錄幾餐，才有東西可以做一週建議。')),
+        const SnackBar(content: Text('先記錄幾餐（至少今天 1–2 餐），AI 才會準')),
       );
       return;
     }
 
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => WeeklyPlanPage(
-          goal: widget.goal,
-          allRecords: List<_FoodRecord>.from(_allRecords),
-          userProfile: _userProfile,
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final todayList = _todayRecords;
-
-    return Scaffold(
-      appBar: AppBar(title: const Text('記錄今日飲食')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text(
-              '目前目標：${widget.goal}',
-              style:
-                  const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-            ),
-            const SizedBox(height: 4),
-            if (_userProfile == null)
-              const Text(
-                '尚未設定個人資料，建議回首頁先填寫，AI 才能更個人化。',
-                style: TextStyle(fontSize: 12, color: Colors.redAccent),
-              )
-            else
-              const Text(
-                '已載入個人資料，AI 建議會依照你的狀態調整。',
-                style: TextStyle(fontSize: 12, color: Colors.green),
-              ),
-            const SizedBox(height: 8),
-            Text(
-              '日期：${_todayDate.year}-${_todayDate.month.toString().padLeft(2, '0')}-${_todayDate.day.toString().padLeft(2, '0')}（只顯示今天）',
-              style: const TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-            const SizedBox(height: 16),
-            DropdownButtonFormField<String>(
-              value: _selectedMeal,
-              decoration: const InputDecoration(
-                labelText: '餐別',
-                border: OutlineInputBorder(),
-              ),
-              items: const [
-                DropdownMenuItem(value: '早餐', child: Text('早餐')),
-                DropdownMenuItem(value: '午餐', child: Text('午餐')),
-                DropdownMenuItem(value: '晚餐', child: Text('晚餐')),
-                DropdownMenuItem(value: '點心', child: Text('點心')),
-              ],
-              onChanged: (value) {
-                if (value == null) return;
-                setState(() {
-                  _selectedMeal = value;
-                });
-              },
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _foodController,
-              decoration: const InputDecoration(
-                labelText: '你吃了什麼？（例如：雞胸肉便當、珍奶半糖去冰）',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: _addRecord,
-              child: const Text('加入紀錄'),
-            ),
-            const SizedBox(height: 16),
-            const Divider(),
-            const SizedBox(height: 8),
-            const Text(
-              '今天的飲食紀錄：',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            Expanded(
-              child: todayList.isEmpty
-                  ? const Center(child: Text('今天還沒有紀錄'))
-                  : ListView.builder(
-                      itemCount: todayList.length,
-                      itemBuilder: (context, index) {
-                        final r = todayList[index];
-                        final timeStr =
-                            '${r.time.hour.toString().padLeft(2, '0')}:${r.time.minute.toString().padLeft(2, '0')}';
-                        return Card(
-                          child: ListTile(
-                            title: Text('${r.meal}：${r.food}'),
-                            subtitle: Text('記錄時間：$timeStr'),
-                            trailing: IconButton(
-                              icon: const Icon(Icons.delete),
-                              onPressed: () => _deleteRecord(index),
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-            ),
-            const SizedBox(height: 8),
-            ElevatedButton(
-              onPressed: _generateSuggestion,
-              child: const Text('產生下一餐建議（前端模擬）'),
-            ),
-            const SizedBox(height: 8),
-            if (_suggestion.isNotEmpty)
-              Card(
-                color: Colors.green.shade50,
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Text(
-                    _suggestion,
-                    style: const TextStyle(fontSize: 14),
-                  ),
-                ),
-              ),
-            const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: _goToSummary,
-              child: const Text('查看今天總結'),
-            ),
-            const SizedBox(height: 8),
-            ElevatedButton(
-              onPressed: _previewAiJson,
-              child: const Text('預覽要給 AI 的資料（含個人資料）'),
-            ),
-            const SizedBox(height: 8),
-            ElevatedButton(
-              onPressed: _goToWeeklyPlan,
-              child: const Text('查看本週飲食建議（AI 後端）'),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ================== 今天總結頁 ==================
-class SummaryPage extends StatelessWidget {
-  final String goal;
-  final List<_FoodRecord> records;
-
-  const SummaryPage({
-    super.key,
-    required this.goal,
-    required this.records,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final total = records.length;
-    final breakfastCount = records.where((r) => r.meal == '早餐').length;
-    final lunchCount = records.where((r) => r.meal == '午餐').length;
-    final dinnerCount = records.where((r) => r.meal == '晚餐').length;
-    final snackCount = records.where((r) => r.meal == '點心').length;
-
-    final String summaryText;
-    if (goal == '增肌') {
-      summaryText =
-          '你的目標是「增肌」。\n\n今天總共記錄了 $total 餐，記得每一餐都要有足夠蛋白質和主食。'
-          '如果有一兩餐比較隨便，下一餐可以加強一些高蛋白和好的碳水，例如：雞胸、牛肉、蛋、豆腐配飯或地瓜。';
-    } else if (goal == '瘦身') {
-      summaryText =
-          '你的目標是「瘦身」。\n\n今天總共記錄了 $total 餐。'
-          '如果點心（$snackCount 次）偏多，之後可以把點心改成水果、優格或無糖飲品，主餐盡量少炸物、少含糖飲料。';
-    } else {
-      summaryText =
-          '你的目標是「維持體態」。\n\n今天總共記錄了 $total 餐。'
-          '只要大部分餐點是有主食、蛋白質和蔬菜的均衡搭配，就可以慢慢維持現在的狀態，偶爾放鬆一餐也沒關係。';
-    }
-
-    return Scaffold(
-      appBar: AppBar(title: const Text('今天總結')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('目標：$goal',
-                style: const TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                )),
-            const SizedBox(height: 16),
-            Text('今天總共記錄了 $total 餐：',
-                style: const TextStyle(fontSize: 16)),
-            const SizedBox(height: 8),
-            Text('・早餐：$breakfastCount 次'),
-            Text('・午餐：$lunchCount 次'),
-            Text('・晚餐：$dinnerCount 次'),
-            Text('・點心：$snackCount 次'),
-            const SizedBox(height: 24),
-            const Text(
-              '系統總結建議：',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            Expanded(
-              child: SingleChildScrollView(
-                child: Text(
-                  summaryText,
-                  style: const TextStyle(fontSize: 14),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ================== AI 請求預覽頁 ==================
-class AiRequestPreviewPage extends StatelessWidget {
-  final String jsonText;
-
-  const AiRequestPreviewPage({
-    super.key,
-    required this.jsonText,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('給 AI 的資料預覽')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: SingleChildScrollView(
-          child: SelectableText(
-            jsonText,
-            style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ================== 每週建議頁（呼叫真正後端 AI） ==================
-class WeeklyPlanPage extends StatefulWidget {
-  final String goal;
-  final List<_FoodRecord> allRecords;
-  final UserProfile? userProfile;
-
-  const WeeklyPlanPage({
-    super.key,
-    required this.goal,
-    required this.allRecords,
-    required this.userProfile,
-  });
-
-  @override
-  State<WeeklyPlanPage> createState() => _WeeklyPlanPageState();
-}
-
-class _WeeklyPlanPageState extends State<WeeklyPlanPage> {
-  String _planText = '';
-  bool _loading = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _callBackend();
-  }
-
-  String _goalToBackendKey() {
-    if (widget.goal == '增肌') return 'muscle_gain';
-    if (widget.goal == '瘦身') return 'fat_loss';
-    return 'maintenance';
-  }
-
-  Future<void> _callBackend() async {
     setState(() {
-      _loading = true;
-      _planText = '';
+      _aiLoading = true;
+      _aiText = '';
     });
 
     try {
-      final today = DateTime.now();
-      final recordsJson = widget.allRecords.map((r) {
-        final timeStr =
-            "${r.time.hour.toString().padLeft(2, '0')}:${r.time.minute.toString().padLeft(2, '0')}";
-        return {
-          "time": timeStr,
-          "mealType": r.meal,
-          "description": r.food,
-        };
-      }).toList();
-
-      final body = {
-        "date":
-            "${today.year.toString().padLeft(4, '0')}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}",
-        "goal": _goalToBackendKey(),
-        "records": recordsJson,
-        "user_profile": widget.userProfile?.toJson() ?? {},
-      };
-
-      final uri = Uri.parse('$backendBaseUrl/analyze-day');
-      final resp = await http.post(
-        uri,
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: jsonEncode(body),
-      );
-
-      if (resp.statusCode == 200) {
-        final data = jsonDecode(resp.body) as Map<String, dynamic>;
-        final score = data['score'];
-        final summary = data['summary'] ?? '';
-        final suggestions = (data['suggestions'] as List<dynamic>?)
-                ?.map((e) => e.toString())
-                .toList() ??
-            [];
-
-        final buffer = StringBuffer();
-        buffer.writeln('【AI 分析結果】');
-        buffer.writeln();
-        buffer.writeln('分數：$score');
-        buffer.writeln();
-        buffer.writeln('總結：');
-        buffer.writeln(summary);
-        buffer.writeln();
-        if (suggestions.isNotEmpty) {
-          buffer.writeln('建議：');
-          for (final s in suggestions) {
-            buffer.writeln('- $s');
-          }
-        }
-
-        setState(() {
-          _planText = buffer.toString();
-          _loading = false;
-        });
-      } else {
-        setState(() {
-          _planText =
-              '後端回傳錯誤（HTTP ${resp.statusCode}）。\n請稍後再試。';
-          _loading = false;
-        });
-      }
-    } catch (e) {
-      setState(() {
-        _planText = '呼叫後端時發生錯誤：$e';
-        _loading = false;
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('本週飲食建議（AI 後端）')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: _loading
-            ? const Center(child: CircularProgressIndicator())
-            : SingleChildScrollView(
-                child: SelectableText(
-                  _planText,
-                  style: const TextStyle(fontSize: 14),
-                ),
-              ),
-      ),
-    );
-  }
-}
-
-// ================== 歷史紀錄頁：列出有紀錄的日期 ==================
-class HistoryPage extends StatefulWidget {
-  const HistoryPage({super.key});
-
-  @override
-  State<HistoryPage> createState() => _HistoryPageState();
-}
-
-class _HistoryPageState extends State<HistoryPage> {
-  static const _prefsKey = 'food_records';
-
-  bool _loading = true;
-  List<_FoodRecord> _allRecords = [];
-  late List<_DaySummary> _days; // 每天的總覽
-
-  @override
-  void initState() {
-    super.initState();
-    _loadHistory();
-  }
-
-  Future<void> _loadHistory() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_prefsKey);
-      if (raw == null) {
-        setState(() {
-          _allRecords = [];
-          _days = [];
-          _loading = false;
-        });
-        return;
-      }
-
-      final List<dynamic> decoded = jsonDecode(raw);
-      final loaded = decoded.map((e) {
-        if (e is Map<String, dynamic>) {
-          return _FoodRecord(
-            meal: e['meal'] as String,
-            food: e['food'] as String,
-            time: DateTime.parse(e['time'] as String),
-          );
-        } else if (e is Map) {
-          return _FoodRecord(
-            meal: e['meal'] as String,
-            food: e['food'] as String,
-            time: DateTime.parse(e['time'] as String),
-          );
-        } else {
-          return _FoodRecord(
-            meal: '未知',
-            food: '未知',
-            time: DateTime.now(),
-          );
-        }
-      }).toList();
-
-      // 依日期分組
-      final Map<DateTime, List<_FoodRecord>> byDate = {};
-      for (final r in loaded) {
-        final d = DateTime(r.time.year, r.time.month, r.time.day);
-        byDate.putIfAbsent(d, () => []);
-        byDate[d]!.add(r);
-      }
-
-      final days = byDate.entries.map((e) {
-        e.value.sort((a, b) => a.time.compareTo(b.time));
-        return _DaySummary(
-          date: e.key,
-          records: e.value,
-        );
-      }).toList();
-
-      // 依日期由新到舊排序
-      days.sort((a, b) => b.date.compareTo(a.date));
+      final payload = await _buildAnalyzePayload();
+      final raw = await _postJson('$backendBaseUrl/analyze-day', payload);
+      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      final text = (decoded['analysis_text'] ?? '').toString();
+      final score = (decoded['score'] ?? '').toString();
 
       setState(() {
-        _allRecords = loaded;
-        _days = days;
-        _loading = false;
+        _aiText = text.isNotEmpty ? text : '（後端回傳空白）';
+        if (score.isNotEmpty && !_aiText.contains('分')) {
+          _aiText = '【AI 分析結果｜$score 分】\n\n$_aiText';
+        }
       });
     } catch (e) {
       setState(() {
-        _allRecords = [];
-        _days = [];
-        _loading = false;
+        _aiText = '呼叫後端時發生錯誤：\n$e';
       });
+    } finally {
+      setState(() => _aiLoading = false);
     }
   }
 
-  String _formatDate(DateTime d) {
-    final y = d.year.toString().padLeft(4, '0');
-    final m = d.month.toString().padLeft(2, '0');
-    final day = d.day.toString().padLeft(2, '0');
-    return '$y-$m-$day';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('歷史飲食紀錄')),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _days.isEmpty
-              ? const Center(
-                  child: Text('目前沒有任何歷史紀錄。\n先去記錄幾天的飲食再回來看吧！'),
-                )
-              : ListView.builder(
-                  itemCount: _days.length,
-                  itemBuilder: (context, index) {
-                    final day = _days[index];
-                    final dateStr = _formatDate(day.date);
-                    final count = day.records.length;
-
-                    // 大略算一下當天早餐 / 午餐 / 晚餐數量，展示給評審看
-                    final breakfastCount =
-                        day.records.where((r) => r.meal == '早餐').length;
-                    final lunchCount =
-                        day.records.where((r) => r.meal == '午餐').length;
-                    final dinnerCount =
-                        day.records.where((r) => r.meal == '晚餐').length;
-
-                    return Card(
-                      child: ListTile(
-                        title: Text('$dateStr  （共 $count 餐）'),
-                        subtitle: Text(
-                            '早餐：$breakfastCount，午餐：$lunchCount，晚餐：$dinnerCount'),
-                        trailing: const Icon(Icons.chevron_right),
-                        onTap: () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (context) => DayDetailPage(
-                                date: day.date,
-                                records: day.records,
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    );
-                  },
-                ),
+  void _goProfile() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const ProfilePage()),
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已回到記錄頁（個人資料已更新）')),
     );
   }
-}
-
-// 每一天的簡單總結資料
-class _DaySummary {
-  final DateTime date;
-  final List<_FoodRecord> records;
-
-  _DaySummary({
-    required this.date,
-    required this.records,
-  });
-}
-
-// ================== 某一天的詳細紀錄頁 ==================
-class DayDetailPage extends StatelessWidget {
-  final DateTime date;
-  final List<_FoodRecord> records;
-
-  const DayDetailPage({
-    super.key,
-    required this.date,
-    required this.records,
-  });
-
-  String _formatDate(DateTime d) {
-    final y = d.year.toString().padLeft(4, '0');
-    final m = d.month.toString().padLeft(2, '0');
-    final day = d.day.toString().padLeft(2, '0');
-    return '$y-$m-$day';
-  }
 
   @override
   Widget build(BuildContext context) {
-    final sorted = [...records]..sort((a, b) => a.time.compareTo(b.time));
+    if (_loading) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    final todayList = _todayRecords;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('${_formatDate(date)} 的紀錄'),
+        title: const Text('記錄今日飲食'),
+        actions: [
+          IconButton(
+            onPressed: _goProfile,
+            icon: const Icon(Icons.person_outline),
+            tooltip: '個人資料',
+          ),
+        ],
       ),
       body: Padding(
         padding: const EdgeInsets.all(16),
-        child: sorted.isEmpty
-            ? const Center(child: Text('這一天沒有任何紀錄'))
-            : ListView.builder(
-                itemCount: sorted.length,
-                itemBuilder: (context, index) {
-                  final r = sorted[index];
-                  final timeStr =
-                      '${r.time.hour.toString().padLeft(2, '0')}:${r.time.minute.toString().padLeft(2, '0')}';
-                  return Card(
-                    child: ListTile(
-                      title: Text('${r.meal}：${r.food}'),
-                      subtitle: Text('時間：$timeStr'),
+        child: Column(
+          children: [
+            _SectionCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '目標：${widget.goal}',
+                    style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '今天：${_fmtDate(DateTime.now())}（只顯示今天紀錄）',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
+                    value: _selectedMeal,
+                    decoration: InputDecoration(
+                      labelText: '餐別',
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
                     ),
-                  );
-                },
+                    items: const [
+                      DropdownMenuItem(value: '早餐', child: Text('早餐')),
+                      DropdownMenuItem(value: '午餐', child: Text('午餐')),
+                      DropdownMenuItem(value: '晚餐', child: Text('晚餐')),
+                      DropdownMenuItem(value: '點心', child: Text('點心')),
+                    ],
+                    onChanged: (v) => setState(() => _selectedMeal = v ?? '早餐'),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _foodController,
+                    decoration: InputDecoration(
+                      labelText: '你吃了什麼？',
+                      hintText: '例如：雞胸便當、茶葉蛋+地瓜、珍奶半糖',
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _PrimaryButton(text: '加入紀錄', onPressed: _addRecord),
+                      ),
+                      const SizedBox(width: 10),
+                      OutlinedButton(
+                        onPressed: _runAiAnalyze,
+                        style: OutlinedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                        ),
+                        child: const Text('AI 分析'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'AI 會使用「最近 7 天」的紀錄來抓你的偏好，越記越像真人。',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                  ),
+                ],
               ),
+            ),
+            const SizedBox(height: 12),
+
+            Expanded(
+              child: ListView(
+                children: [
+                  _SectionCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('今天的飲食紀錄', style: TextStyle(fontWeight: FontWeight.w800)),
+                        const SizedBox(height: 10),
+                        if (todayList.isEmpty)
+                          const Text('今天還沒有紀錄', style: TextStyle(fontSize: 13))
+                        else
+                          ...List.generate(todayList.length, (i) {
+                            final r = todayList[i];
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFF2F6F3),
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                                child: ListTile(
+                                  title: Text('${r.meal}：${r.food}'),
+                                  subtitle: Text('時間：${_fmtTime(r.time)}'),
+                                  trailing: IconButton(
+                                    icon: const Icon(Icons.delete_outline),
+                                    onPressed: () => _deleteTodayRecord(i),
+                                  ),
+                                ),
+                              ),
+                            );
+                          }),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  _SectionCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('AI 分析結果', style: TextStyle(fontWeight: FontWeight.w800)),
+                        const SizedBox(height: 10),
+                        if (_aiLoading)
+                          Row(
+                            children: const [
+                              SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              ),
+                              SizedBox(width: 10),
+                              Expanded(child: Text('AI 分析中...')),
+                            ],
+                          )
+                        else if (_aiText.isEmpty)
+                          Text(
+                            '按「AI 分析」後會在這裡顯示。\n\n'
+                            '如果你覺得內容很像，通常是因為紀錄太少；至少連續記 3–7 天會差很多。',
+                            style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
+                          )
+                        else
+                          SelectableText(
+                            _aiText,
+                            style: const TextStyle(fontSize: 13, height: 1.35),
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  _SectionCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('後端網址（你現在用雲端）', style: TextStyle(fontWeight: FontWeight.w800)),
+                        const SizedBox(height: 8),
+                        SelectableText(
+                          backendBaseUrl,
+                          style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
-}
-
-// ================== 紀錄模型 ==================
-class _FoodRecord {
-  final String meal;
-  final String food;
-  final DateTime time;
-
-  _FoodRecord({
-    required this.meal,
-    required this.food,
-    required this.time,
-  });
 }

@@ -4,6 +4,8 @@ from typing import List, Optional, Literal, Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+import openai
+logger.info(f"OpenAI SDK version: {openai.__version__}")
 
 # --------- Logging ----------
 logger = logging.getLogger("ai_diet_backend")
@@ -139,17 +141,16 @@ def format_logs(logs: List[FoodLog]) -> str:
         out.append(f"{i}. {dt} {x.meal_type}：{x.description}")
     return "\n".join(out)
 
+import openai, httpx
+logger.info(f"openai={openai.__version__}, httpx={httpx.__version__}")
 
 async def call_openai(system_prompt: str, user_prompt: str) -> str:
-    # 關鍵：不要在 import 時就初始化 OpenAI，避免沒 key 就整個炸
     from openai import OpenAI
-
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
 
     client = OpenAI(api_key=api_key)
-
     resp = client.chat.completions.create(
         model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
         messages=[
