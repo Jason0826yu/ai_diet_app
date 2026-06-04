@@ -26,6 +26,10 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>需要使用相機拍攝食物照片進行 AI 熱量分析</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>需要選擇食物照片進行 AI 熱量分析</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>

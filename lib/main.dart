@@ -3,7 +3,10 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-
+import 'dart:io';
+import 'package:image_picker/image_picker.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 /// 你現在用雲端後端（Render）就填這個
 /// 例：'https://ai-diet-backend-q493.onrender.com'
 const String backendBaseUrl = 'https://ai-diet-backend-q493.onrender.com';
@@ -182,6 +185,86 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  Future<void> pickAndUploadImage() async {
+  final picker = ImagePicker();
+  final pickedFile = await picker.pickImage(source: ImageSource.camera);
+
+  if (pickedFile == null) return;
+
+  showDialog(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => const AlertDialog(
+      title: Text("分析中..."),
+      content: Text("AI 正在分析你的食物照片"),
+    ),
+  );
+
+  try {
+    var request = http.MultipartRequest(
+      'POST',
+      Uri.parse('http://192.168.0.20:8000/analyze-photo'),
+    );
+
+    request.files.add(
+      await http.MultipartFile.fromPath('file', pickedFile.path),
+    );
+
+    var response = await request.send();
+    final respStr = await response.stream.bytesToString();
+
+    Navigator.pop(context);
+
+    final data = jsonDecode(respStr);
+    final result = data["result"] ?? "沒有分析結果";
+
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(24),
+        ),
+        title: const Text(
+          "AI 熱量分析",
+          style: TextStyle(
+            fontSize: 24,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        content: Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Color(0xFFF1F5EC),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Text(
+            result,
+            style: const TextStyle(
+              fontSize: 18,
+              height: 1.5,
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("完成"),
+          ),
+        ],
+      ),
+    );
+  } catch (e) {
+    Navigator.pop(context);
+
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("分析失敗"),
+        content: Text("錯誤：$e"),
+      ),
+    );
+  }
+}
   String _goal = '維持體態';
   UserProfile? _profile;
 
@@ -244,6 +327,7 @@ class _HomePageState extends State<HomePage> {
         ],
       ),
       body: Padding(
+        
         padding: const EdgeInsets.all(16),
         child: ListView(
           children: [
@@ -277,6 +361,7 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ],
                   ),
+                  
                   const SizedBox(height: 12),
                   Row(
                     children: [
@@ -297,6 +382,10 @@ class _HomePageState extends State<HomePage> {
                 ],
               ),
             ),
+            ElevatedButton(
+                    onPressed: pickAndUploadImage,
+                    child: Text("拍照分析熱量"),
+                  ),
             const SizedBox(height: 12),
             _SectionCard(
               child: Column(
@@ -873,20 +962,7 @@ class _FoodLogPageState extends State<FoodLogPage> {
                       ],
                     ),
                   ),
-                  const SizedBox(height: 12),
-                  _SectionCard(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('後端網址（你現在用雲端）', style: TextStyle(fontWeight: FontWeight.w800)),
-                        const SizedBox(height: 8),
-                        SelectableText(
-                          backendBaseUrl,
-                          style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
-                        ),
-                      ],
-                    ),
-                  ),
+                  
                 ],
               ),
             ),

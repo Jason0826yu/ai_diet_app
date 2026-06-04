@@ -1,3 +1,8 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
+import openai
 import os
 import logging
 from typing import List, Optional, Literal, Any
@@ -5,14 +10,44 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import openai
-logger.info(f"OpenAI SDK version: {openai.__version__}")
+import os
+from openai import OpenAI
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+import base64
+from fastapi import UploadFile, File
+app = FastAPI()
+import base64
+
+@app.post("/analyze-photo")
+async def analyze_photo(file: UploadFile = File(...)):
+    try:
+        image_bytes = await file.read()
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "請用繁體中文分析這張食物照片，回答食物名稱、估計熱量、簡短建議。"},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_base64}"}
+                    ]
+                }
+            ]
+        )
+
+        return {"result": response.output_text}
+
+    except Exception as e:
+        return {"result": f"後端錯誤：{str(e)}"}
 # --------- Logging ----------
 logger = logging.getLogger("ai_diet_backend")
 logging.basicConfig(level=logging.INFO)
 
 # --------- FastAPI ----------
-app = FastAPI(title="AI Diet Backend", version="1.0.0")
 
 # 允許跨網域（給 Flutter 打）
 app.add_middleware(
